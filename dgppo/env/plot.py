@@ -4,6 +4,7 @@ import numpy as np
 import jax
 import pathlib
 import functools as ft
+import matplotlib.patches as mpatches
 
 from colour import hsl2hex
 from matplotlib.animation import FuncAnimation
@@ -217,6 +218,8 @@ def render_mpe(
         viz_opts: dict = None,
         dpi: int = 100,
         n_goal: Optional[int] = None,
+        include_orientation: bool = False,
+        agent_types: Optional[Array] = None,
         **kwargs
 ):
     assert dim == 1 or dim == 2 or dim == 3
@@ -245,9 +248,12 @@ def render_mpe(
     T_graph = rollout.graph
     graph0 = tree_index(T_graph, 0)
 
-    agent_color = "#0068ff"
-    goal_color = "#2fdd00"
-    obs_color = "#8a0000"
+    # Define colors for different agent types
+    leader_color = "#FF6B6B"  # 领导者颜色：红色
+    follower_color = "#4ECDC4"  # 跟随者颜色：青色
+    agent_color = "#0068ff"  # 默认代理颜色：蓝色
+    goal_color = "#2fdd00"  # 目标颜色：绿色
+    obs_color = "#8a0000"  # 障碍物颜色：暗红色
     edge_goal_color = goal_color
 
     # plot obstacles
@@ -260,17 +266,71 @@ def render_mpe(
             obs_col = MutablePatchCollection(obs_circs, match_original=True, zorder=1)
             ax.add_collection(obs_col)
 
-    # plot agents
-    n_color = [agent_color] * n_agent + [goal_color] * n_goal
+    # plot agents with different colors based on agent_types
+    if agent_types is not None:
+        n_color = []
+        for i in range(n_agent):
+            if agent_types[i] == 0:  # LEADER
+                n_color.append(leader_color)
+            else:  # FOLLOWER
+                n_color.append(follower_color)
+    else:
+        n_color = [agent_color] * n_agent
+    
+    # Add colors for goals
+    n_color.extend([goal_color] * n_goal)
+    
     n_pos = np.array(graph0.states[:n_agent + n_goal, :dim]).astype(np.float32)
     n_radius = np.array([r] * (n_agent + n_goal))
+    
+    # For orientation visualization
+    direction_arrows = []
+    fov_wedges = []
+    
     if dim == 1 or dim == 2:
         if dim == 1:
             n_pos = np.concatenate([n_pos, np.ones((n_agent + n_goal, 1)) * side_length / 2], axis=1)
+        
+        # Draw agents as circles
         agent_circs = [plt.Circle(n_pos[ii], n_radius[ii], color=n_color[ii], linewidth=0.0)
-                       for ii in range(n_agent + n_goal)]
+                      for ii in range(n_agent + n_goal)]
         agent_col = MutablePatchCollection([i for i in reversed(agent_circs)], match_original=True, zorder=6)
         ax.add_collection(agent_col)
+        
+        # Draw orientation arrows and field of view if enabled
+        if include_orientation and dim == 2:
+            # Get orientation information (assuming it's in the 3rd column of states)
+            orientations = np.array(graph0.states[:n_agent, 2]).astype(np.float32)
+            arrow_length = r * 2.0  # Arrow length relative to agent radius
+            
+            # Create orientation arrows for agents
+            for i in range(n_agent):
+                # Calculate arrow endpoint
+                dx = arrow_length * np.cos(orientations[i])
+                dy = arrow_length * np.sin(orientations[i])
+                arrow = ax.arrow(n_pos[i, 0], n_pos[i, 1], dx, dy, 
+                                head_width=r*0.7, head_length=r*0.7, 
+                                fc='k', ec='k', zorder=7, alpha=0.7)
+                direction_arrows.append(arrow)
+            
+            # Create field of view visualizations if specified in viz_opts
+            if viz_opts.get("show_fov", False):
+                fov_angle = viz_opts.get("fov_angle", 60)  # Default 60 degrees if not specified
+                fov_alpha = viz_opts.get("fov_alpha", 0.2)  # Transparency
+                comm_radius = viz_opts.get("comm_radius", 1.0)  # Communication radius
+                
+                # Convert FOV angle from degrees to radians
+                fov_angle_rad = np.deg2rad(fov_angle)
+                
+                for i in range(n_agent):
+                    # Calculate the FOV wedge
+                    theta1 = orientations[i] - fov_angle_rad/2
+                    theta2 = orientations[i] + fov_angle_rad/2
+                    wedge = mpatches.Wedge(n_pos[i], comm_radius, 
+                                          np.rad2deg(theta1), np.rad2deg(theta2),
+                                          alpha=fov_alpha, color=n_color[i], zorder=2)
+                    fov_wedges.append(wedge)
+                    ax.add_patch(wedge)
     else:
         plot_r = ax.transData.transform([r, 0])[0] - ax.transData.transform([0, 0])[0]
         agent_col = ax.scatter(n_pos[:, 0], n_pos[:, 1], n_pos[:, 2],
@@ -344,9 +404,11 @@ def render_mpe(
         for ii in range(n_agent):
             pos2d = proj3d.proj_transform(n_pos[ii, 0], n_pos[ii, 1], n_pos[ii, 2], ax.get_proj())[:2]
             agent_labels.append(ax.text2D(pos2d[0], pos2d[1], f"{ii}", **label_font_opts))
-
+    
     # plot cbf
     cnt_col = []
+    cnt = None
+    cnt_line = None
     if "cbf" in viz_opts:
         if dim == 1 or dim == 3:
             print('Warning: CBF visualization is not supported in 1D or 3D.')
@@ -370,6 +432,8 @@ def render_mpe(
             cnt_col = [*cnt.collections, *cnt_line.collections]
 
             ax.text(0.5, 1.0, "CBF for {}".format(cbf_num), transform=ax.transAxes, va="bottom")
+    
+    Vh_text = None
     if "Vh" in viz_opts:
         if dim == 1 or dim == 2:
             Vh_text = ax.text(0.99, 0.99, "Vh: []", va="top", ha="right", zorder=100, **text_font_opts)
@@ -379,7 +443,7 @@ def render_mpe(
     # init function for animation
     def init_fn() -> list[plt.Artist]:
         return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
-
+            
     # update function for animation
     def update(kk: int) -> list[plt.Artist]:
         graph = tree_index(T_graph, kk)
@@ -391,6 +455,45 @@ def render_mpe(
         if dim == 1 or dim == 2:
             for ii in range(n_agent):
                 agent_circs[ii].set_center(tuple(n_pos_t[ii]))
+                
+            # update orientation arrows and FOV if needed
+            if include_orientation and dim == 2:
+                # Get updated orientations
+                orientations_t = np.array(graph.states[:n_agent, 2]).astype(np.float32)
+                
+                # Update orientation arrows
+                for i in range(n_agent):
+                    # Remove old arrow
+                    if direction_arrows[i] in ax.get_children():
+                        direction_arrows[i].remove()
+                    
+                    # Create new arrow at updated position/orientation
+                    arrow_length = r * 2.0
+                    dx = arrow_length * np.cos(orientations_t[i])
+                    dy = arrow_length * np.sin(orientations_t[i])
+                    direction_arrows[i] = ax.arrow(n_pos_t[i, 0], n_pos_t[i, 1], dx, dy,
+                                                head_width=r*0.7, head_length=r*0.7,
+                                                fc='k', ec='k', zorder=7, alpha=0.7)
+                
+                # Update FOV wedges if enabled
+                if viz_opts.get("show_fov", False):
+                    fov_angle = viz_opts.get("fov_angle", 60)
+                    fov_alpha = viz_opts.get("fov_alpha", 0.2)
+                    comm_radius = viz_opts.get("comm_radius", 1.0)
+                    fov_angle_rad = np.deg2rad(fov_angle)
+                    
+                    for i in range(n_agent):
+                        # Remove old wedge
+                        if fov_wedges[i] in ax.get_children():
+                            fov_wedges[i].remove()
+                        
+                        # Create new wedge at updated position/orientation
+                        theta1 = orientations_t[i] - fov_angle_rad/2
+                        theta2 = orientations_t[i] + fov_angle_rad/2
+                        fov_wedges[i] = mpatches.Wedge(n_pos_t[i], comm_radius,
+                                                    np.rad2deg(theta1), np.rad2deg(theta2),
+                                                    alpha=fov_alpha, color=n_color[i], zorder=2)
+                        ax.add_patch(fov_wedges[i])
         else:
             agent_col.set_offsets(n_pos_t[:n_agent + n_goal, :2])
             agent_col.set_3d_properties(n_pos_t[:n_agent + n_goal, 2], zdir='z')
@@ -454,8 +557,15 @@ def render_mpe(
             Vh_text.set_text(f"Vh: {viz_opts['Vh'][kk]}")
 
         kk_text.set_text("kk={:04}".format(kk))
-
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
+        
+        # Gather all artists for update
+        all_artists = [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
+        if include_orientation and dim == 2:
+            all_artists.extend(direction_arrows)
+            if viz_opts.get("show_fov", False):
+                all_artists.extend(fov_wedges)
+                
+        return all_artists
 
     fps = 30.0
     spf = 1 / fps

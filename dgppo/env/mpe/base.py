@@ -170,6 +170,7 @@ class MPE(MultiAgentEnv, ABC):
         dist = jnp.linalg.norm(jnp.expand_dims(agent_pos, 1) - jnp.expand_dims(agent_pos, 0), axis=-1)
         dist += jnp.eye(self.num_agents) * 1e6
         min_dist = jnp.min(dist, axis=1)
+        
         agent_cost: Array = self.params["car_radius"] * 2 - min_dist
 
         # collision between agents and obstacles

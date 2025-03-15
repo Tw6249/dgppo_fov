@@ -4,11 +4,14 @@ import jax.random as jr
 from typing import NamedTuple, Tuple, Optional, List, Dict
 from functools import partial
 import numpy as np
+import pathlib
 
-from dgppo.utils.graph import EdgeBlock, GraphsTuple
+from dgppo.utils.graph import EdgeBlock, GraphsTuple, GetGraph
 from dgppo.utils.typing import Action, Array, Cost, Done, Info, Reward, State, AgentState, Pos2d
 from dgppo.env.mpe.base import MPE, MPEEnvState, MPEEnvGraphsTuple
 from dgppo.env.utils import get_node_goal_rng
+from dgppo.env.plot import render_mpe
+from dgppo.trainer.data import Rollout
 
 
 class MPEFoVState(NamedTuple):
@@ -49,7 +52,6 @@ class MPEFoV(MPE):
         "dist2goal": 0.1,             # Distance threshold to goal
         "alpha_max": 60,              # Maximum communication angle in degrees
         "n_leaders": 2,               # Number of leader agents
-        "critical_neighbors": {},     # Dictionary mapping agent IDs to their critical neighbor IDs
     }
     
     def __init__(
@@ -71,8 +73,8 @@ class MPEFoV(MPE):
         self.agent_types = self.agent_types.at[:self.num_goals].set(self.LEADER)
         self.agent_types = self.agent_types.at[self.num_goals:].set(self.FOLLOWER)
         
-        # Critical neighbors will be set during reset
-        self.critical_neighbors = {}
+        # Initial neighbors will be set during reset
+        self.neighbor_indices = jnp.ones((self.num_agents,), dtype=jnp.int32) * -1  # Initialize with -1 (no neighbors)
     
     @property
     def state_dim(self) -> int:
@@ -80,7 +82,7 @@ class MPEFoV(MPE):
     
     @property
     def node_dim(self) -> int:
-        return 9  # state_dim (6) + indicator: agent: 001, goal: 010, obstacle: 100
+        return 10  # state_dim (6) + indicator: leader: 0001, follower: 0010, goal: 0100, obstacle: 1000
     
     @property
     def edge_dim(self) -> int:
@@ -88,42 +90,21 @@ class MPEFoV(MPE):
     
     @property
     def action_dim(self) -> int:
-        return 2  # Linear acceleration, angular acceleration
+        return 3  # x acceleration, y acceleration, angular acceleration
     
     @property
     def n_cost(self) -> int:
-        return 2  # agent collisions, connectivity
+        return 4  # agent collisions, fov condition 1, fov condition 2, distance condition
     
     @property
     def cost_components(self) -> Tuple[str, ...]:
-        return "agent collisions", "connectivity"
+        return "agent collisions", "viewing angle (i→j)", "viewing angle (j→i)", "distance"
     
-    def _identify_critical_neighbors(self, agent_states: State) -> Dict[int, List[int]]:
+    def _identify_initial_neighbors(self, agent_states: State) -> Array:
         """
-        Identify critical neighbors for each agent based on proximity and communication ability.
-        For each agent, select the closest agent that can communicate bidirectionally.
-        
-        Returns a dictionary where keys are agent indices and values are lists of critical neighbor indices.
-        NOTE: This function is adapted to work outside of JIT compilation since it returns a Python dict.
-        Use _identify_critical_neighbors_jax for JIT-compatible version.
-        """
-        # Get JIT-compatible neighbor indices
-        neighbor_indices = self._identify_critical_neighbors_jax(agent_states)
-        
-        # Convert to Python dictionary format (for compatibility with existing code)
-        critical_neighbors = {}
-        for i in range(self.num_agents):
-            # Check if there is a valid neighbor (not -1)
-            if neighbor_indices[i] != -1:
-                critical_neighbors[i] = [int(neighbor_indices[i])]
-        
-        return critical_neighbors
-    
-    def _identify_critical_neighbors_jax(self, agent_states: State) -> Array:
-        """
-        JAX-compatible version of critical neighbor identification.
-        Returns an array where each element i contains the index of agent i's critical neighbor,
-        or -1 if there is no critical neighbor.
+        JAX-compatible version of initial neighbor identification.
+        Returns an array where each element i contains the index of agent i's initial neighbor,
+        or -1 if there is no initial neighbor.
         """
         # Get communication matrix
         comm_matrix = self._get_communication_matrix(agent_states)
@@ -138,7 +119,7 @@ class MPEFoV(MPE):
         # Set non-communicating agents to infinite distance
         masked_distances = jnp.where(comm_matrix, distances, jnp.ones_like(distances) * float('inf'))
         
-        # Set self-distance to infinity (can't be your own critical neighbor)
+        # Set self-distance to infinity (can't be your own initial neighbor)
         masked_distances = masked_distances.at[jnp.arange(len(positions)), jnp.arange(len(positions))].set(float('inf'))
         
         # For each agent, find the closest agent that can communicate
@@ -149,9 +130,9 @@ class MPEFoV(MPE):
         valid_neighbor_mask = min_distances < float('inf')
         
         # Return indices or -1 for agents without valid neighbors
-        critical_neighbor_indices = jnp.where(valid_neighbor_mask, min_dist_indices, -1 * jnp.ones_like(min_dist_indices))
+        initial_neighbor_indices = jnp.where(valid_neighbor_mask, min_dist_indices, -1 * jnp.ones_like(min_dist_indices))
         
-        return critical_neighbor_indices
+        return initial_neighbor_indices
 
     def _is_strongly_connected(self, comm_matrix):
         """
@@ -275,17 +256,14 @@ class MPEFoV(MPE):
         return final_leader_pos, final_follower_pos, final_key
 
     def reset(self, key: Array) -> GraphsTuple:
-        """Reset the environment, placing agents in a structured topology.
+        """Reset the environment, placing agents in a chain topology.
         
-        Generates a strongly connected communication graph by using structured
-        topologies like star, chain, or ring formations. Carefully places agents
-        and adjusts their orientations to ensure FOV communication requirements are met.
+        Generates a strongly connected communication graph by placing the agents
+        in a chain formation where each agent can communicate with its neighbors.
+        Carefully adjusts orientations to ensure FOV communication requirements are met.
         """
         # Split the key for different random operations
-        key, subkey1, subkey2, subkey3, subkey4 = jr.split(key, 5)
-        
-        # Choose a random topology type: 0=star, 1=chain, 2=ring
-        topology_type = jr.choice(subkey1, jnp.array([0, 1, 2]))
+        key, subkey1, subkey2, subkey3 = jr.split(key, 4)
         
         # Central position for formations (center of the area)
         center_pos = jnp.array([self.area_size/2, self.area_size/2])
@@ -296,96 +274,39 @@ class MPEFoV(MPE):
         # Initialize agent positions array
         agent_positions = jnp.zeros((self.num_agents, 2))
         
-        # Define formation functions
-        def create_star_formation(positions):
-            # Central agent at the center
-            positions = positions.at[0].set(center_pos)
+        # Always create a chain formation
+        # Place agents in a line
+        for i in range(self.num_agents):
+            # Position along the chain
+            progress = i / (self.num_agents - 1)  # 0 to 1
+            pos_x = center_pos[0] - formation_radius + 2 * formation_radius * progress
+            pos_y = center_pos[1]
             
-            # Place other agents in a circle around the central agent
-            for i in range(1, self.num_agents):
-                # Angle for this agent
-                angle = 2 * jnp.pi * (i - 1) / (self.num_agents - 1)
-                
-                # Position on the circle
-                pos_x = center_pos[0] + formation_radius * jnp.cos(angle)
-                pos_y = center_pos[1] + formation_radius * jnp.sin(angle)
-                
-                positions = positions.at[i].set(jnp.array([pos_x, pos_y]))
-            
-            return positions
-            
-        def create_chain_formation(positions):
-            # Place agents in a line
-            for i in range(self.num_agents):
-                # Position along the chain
-                progress = i / (self.num_agents - 1)  # 0 to 1
-                pos_x = center_pos[0] - formation_radius + 2 * formation_radius * progress
-                pos_y = center_pos[1]
-                
-                positions = positions.at[i].set(jnp.array([pos_x, pos_y]))
-                
-            return positions
-            
-        def create_ring_formation(positions):
-            # Place agents in a circle
-            for i in range(self.num_agents):
-                # Angle for this agent
-                angle = 2 * jnp.pi * i / self.num_agents
-                
-                # Position on the circle
-                pos_x = center_pos[0] + formation_radius * jnp.cos(angle)
-                pos_y = center_pos[1] + formation_radius * jnp.sin(angle)
-                
-                positions = positions.at[i].set(jnp.array([pos_x, pos_y]))
-                
-            return positions
+            agent_positions = agent_positions.at[i].set(jnp.array([pos_x, pos_y]))
         
-        # Use JAX's functional approach to select the formation
-        agent_positions = jnp.where(topology_type == 0, 
-                                   create_star_formation(agent_positions), 
-                                   jnp.where(topology_type == 1,
-                                           create_chain_formation(agent_positions),
-                                           create_ring_formation(agent_positions)))
+        # Add some small random noise to y position to avoid perfect line
+        # This helps with numerical stability in some calculations
+        key, noise_key = jr.split(key)
+        y_noise = jr.uniform(noise_key, (self.num_agents, 1), minval=-0.05, maxval=0.05)
+        agent_positions = agent_positions.at[:, 1].add(y_noise[:, 0])
         
-        # Set orientations based on formation type using the same JAX-compatible approach
+        # Set orientations to face neighbors to ensure communication
         agent_orientations = jnp.zeros(self.num_agents)
         
-        def set_star_orientations(orientations):
-            # Central agent random orientation
-            orientations = orientations.at[0].set(jr.uniform(subkey2, minval=0, maxval=2*jnp.pi))
-            
-            # Others pointing toward center
-            for i in range(1, self.num_agents):
-                # Calculate direction vector to center
-                direction = center_pos - agent_positions[i]
-                # Calculate angle (atan2 takes y, x in that order)
-                angle = jnp.arctan2(direction[1], direction[0])
-                orientations = orientations.at[i].set(angle)
-            
-            return orientations
-            
-        def set_chain_orientations(orientations):
-            # All agents face the same direction along the chain
-            orientations = orientations.at[:].set(0.0)  # All face right (0 radians)
-            return orientations
-            
-        def set_ring_orientations(orientations):
-            # Each agent faces tangent to the circle (90 degrees rotated from radius)
-            for i in range(self.num_agents):
-                # Angle for this agent
-                angle = 2 * jnp.pi * i / self.num_agents
-                # Tangent orientation
-                tangent_angle = angle + jnp.pi/2
-                orientations = orientations.at[i].set(tangent_angle)
-            
-            return orientations
+        # For chain topology, each agent faces towards the next agent, except the last one
+        # which faces toward the previous agent
+        for i in range(self.num_agents-1):
+            # Calculate direction vector to next agent
+            direction = agent_positions[i+1] - agent_positions[i]
+            # Calculate angle (atan2 takes y, x in that order)
+            angle = jnp.arctan2(direction[1], direction[0])
+            agent_orientations = agent_orientations.at[i].set(angle)
         
-        # Apply orientation function based on topology_type
-        agent_orientations = jnp.where(topology_type == 0,
-                                      set_star_orientations(agent_orientations),
-                                      jnp.where(topology_type == 1,
-                                              set_chain_orientations(agent_orientations),
-                                              set_ring_orientations(agent_orientations)))
+        # Last agent faces back
+        if self.num_agents > 1:
+            direction = agent_positions[self.num_agents-2] - agent_positions[self.num_agents-1]
+            angle = jnp.arctan2(direction[1], direction[0])
+            agent_orientations = agent_orientations.at[self.num_agents-1].set(angle)
         
         # Initialize velocities to zero
         agent_velocities = jnp.zeros((self.num_agents, 2))
@@ -416,28 +337,32 @@ class MPEFoV(MPE):
             jnp.zeros((self.num_goals, 4))  # psi, vx, vy, omega all zero for goals
         ], axis=1)
         
-        # Empty obstacle array with right dimensions - using JAX-compatible approach
-        obs = jnp.zeros((jnp.maximum(self.params["n_obs"], 0), self.state_dim))
-        obs = jnp.where(self.params["n_obs"] > 0, obs, jnp.zeros((0, self.state_dim)))
+        # Empty obstacle array with right dimensions - using static shapes for JAX compatibility
+        n_obs = int(self.params["n_obs"])  # Convert to static int value
+        if n_obs > 0:
+            obs = jnp.zeros((n_obs, self.state_dim))
+        else:
+            obs = jnp.zeros((0, self.state_dim))
         
-        # Validate and fix connectivity - separate connectivity check and fix functions
+        # Check connectivity to ensure a strongly connected graph
         comm_matrix = self._get_communication_matrix(states)
         is_connected = self._is_strongly_connected(comm_matrix)
-        
-        # Define connectivity fix function to be applied conditionally
-        def fix_connectivity(states_to_fix, conn_matrix):
-            # Your connectivity fixing logic here
-            # For now, let's just return the original states
-            return states_to_fix
-            
-        # Apply connectivity fix conditionally
-        states = jnp.where(is_connected, states, fix_connectivity(states, comm_matrix))
         
         # Create initial environment state
         env_state = MPEFoVState(states, goals, obs)
         
-        # Identify critical neighbors based on initial state
-        self.critical_neighbors = self._identify_critical_neighbors(states)
+        # Use JIT-compatible version for reset to set initial neighbors
+        # Here we define the chain links: each agent i is linked to agent i+1
+        # except the last agent which is linked to none or to the first agent to form a cycle
+        initial_links = jnp.arange(1, self.num_agents)  # [1, 2, ..., n-1]
+        initial_links = jnp.pad(initial_links, (0, 1), constant_values=-1)  # padding last agent
+        
+        # If we want a cycle, connect the last agent back to the first
+        form_cycle = True
+        if form_cycle and self.num_agents > 2:
+            initial_links = initial_links.at[self.num_agents-1].set(0)
+        
+        self.neighbor_indices = initial_links
         
         return self.get_graph(env_state)
     
@@ -455,12 +380,13 @@ class MPEFoV(MPE):
         omega = agent_states[:, 5]
         
         # Extract actions
-        linear_acc = action[:, 0] * 5.0  # Scale linear acceleration
-        angular_acc = action[:, 1] * 5.0  # Scale angular acceleration
+        x_acc = action[:, 0] * 5.0  # Scale x acceleration
+        y_acc = action[:, 1] * 5.0  # Scale y acceleration
+        angular_acc = action[:, 2] * 5.0  # Scale angular acceleration
         
         # Update velocities
-        vx_new = vx + linear_acc * jnp.cos(psi) * self.dt
-        vy_new = vy + linear_acc * jnp.sin(psi) * self.dt
+        vx_new = vx + x_acc * self.dt
+        vy_new = vy + y_acc * self.dt
         omega_new = omega + angular_acc * self.dt
         
         # Update positions and orientation
@@ -476,6 +402,42 @@ class MPEFoV(MPE):
         
         return self.clip_state(new_states)
     
+    def agent_step_euler_without_clip(self, agent_states: AgentState, action: Action) -> AgentState:
+        """Update agent states using Euler integration without clipping"""
+        assert action.shape == (self.num_agents, self.action_dim)
+        assert agent_states.shape == (self.num_agents, self.state_dim)
+        
+        # Extract current state components
+        x = agent_states[:, 0]
+        y = agent_states[:, 1]
+        psi = agent_states[:, 2]
+        vx = agent_states[:, 3]
+        vy = agent_states[:, 4]
+        omega = agent_states[:, 5]
+        
+        # Extract actions
+        x_acc = action[:, 0] * 5.0  # Scale x acceleration
+        y_acc = action[:, 1] * 5.0  # Scale y acceleration
+        angular_acc = action[:, 2] * 5.0  # Scale angular acceleration
+        
+        # Update velocities
+        vx_new = vx + x_acc * self.dt
+        vy_new = vy + y_acc * self.dt
+        omega_new = omega + angular_acc * self.dt
+        
+        # Update positions and orientation
+        x_new = x + vx * self.dt
+        y_new = y + vy * self.dt
+        psi_new = psi + omega * self.dt
+        
+        # Normalize psi to [0, 2π)
+        psi_new = psi_new % (2 * jnp.pi)
+        
+        # Combine into new state
+        new_states = jnp.stack([x_new, y_new, psi_new, vx_new, vy_new, omega_new], axis=1)
+        
+        return new_states
+    
     def step(
             self, graph: MPEFoVGraphsTuple, action: Action, get_eval_info: bool = False
     ) -> Tuple[MPEFoVGraphsTuple, Reward, Cost, Done, Info]:
@@ -489,6 +451,9 @@ class MPEFoV(MPE):
         
         # Calculate next graph
         action = self.clip_action(action)
+        
+        # Directly apply Euler integration with clipping, without tracking out-of-bounds
+        # This matches the approach used in MPESpread
         next_agent_states = self.agent_step_euler(agent_states, action)
         next_env_state = MPEFoVState(next_agent_states, goals, obstacles if obstacles is not None else jnp.zeros((0, self.state_dim)))
         info = {}
@@ -509,40 +474,26 @@ class MPEFoV(MPE):
         
         reward = jnp.zeros(()).astype(jnp.float32)
         
-        # 1. Leaders get reward for reaching goals
+        # 1. All leaders try to reach their goals
         leader_positions = agent_states[:self.num_goals, :2]
         goal_positions = goals[:, :2]
         
         # Distance from leaders to their goals
-        dist2goal = jnp.linalg.norm(goal_positions - leader_positions, axis=1)
+        leader_goal_dist = jnp.linalg.norm(goal_positions - leader_positions, axis=1)
         
-        # Reward based on distance to goal
-        reward -= dist2goal.mean() * 0.1
+        # Reward based on distance to goal (negative reward proportional to distance)
+        reward -= leader_goal_dist.mean() * 0.1
         
-        # Bonus for reaching goals
-        reward += jnp.sum(jnp.where(dist2goal < self.params["dist2goal"], 1.0, 0.0)) * 0.1
+        # Bonus for leaders reaching goals
+        reward += jnp.sum(jnp.where(leader_goal_dist < self.params["dist2goal"], 1.0, 0.0)) * 0.1
         
-        # 2. Reward for maintaining critical communication links
-        comm_matrix = self._get_communication_matrix(agent_states)
-        critical_links_maintained = jnp.array(1.0)
-        
-        # Check if critical links are maintained
-        for agent_id, neighbors in self.critical_neighbors.items():
-            for neighbor_id in neighbors:
-                # Check if the link is maintained
-                link_maintained = comm_matrix[agent_id, neighbor_id]
-                critical_links_maintained = critical_links_maintained * link_maintained
-        
-        # Reward for critical link maintenance
-        reward += critical_links_maintained * 0.1
-        
-        # 3. Small penalty for actions (energy efficiency)
-        reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.01
+        # Small penalty for actions (energy efficiency)
+        reward -= (jnp.linalg.norm(action, axis=1) ** 2).mean() * 0.0001
         
         return reward
     
     def get_cost(self, graph: MPEFoVGraphsTuple) -> Cost:
-        """Calculate cost for the current state"""
+        """Calculate cost for the current state using the three FOV communication conditions"""
         agent_states = graph.type_states(type_idx=0, n_type=self.num_agents)
         
         # Agent positions
@@ -554,28 +505,117 @@ class MPEFoV(MPE):
         min_dist = jnp.min(dist, axis=1)
         agent_cost = self.params["car_radius"] * 2 - min_dist
         
-        # 2. Cost for critical communication link breaks
-        comm_matrix = self._get_communication_matrix(agent_states)
-        critical_links_maintained = jnp.array(1.0)
+        # 2. Cost for initial communication link breaks
+        # 移除未使用的comm_matrix
         
-        # Check if critical links are maintained
-        for agent_id, neighbors in self.critical_neighbors.items():
-            for neighbor_id in neighbors:
-                # Check if the link is maintained
-                link_maintained = comm_matrix[agent_id, neighbor_id]
-                critical_links_maintained = critical_links_maintained * link_maintained
+        # Get current connectivity conditions
+        positions = agent_states[:, :2]  # x, y
+        orientations = agent_states[:, 2]  # psi
         
-        # Cost is high if critical links are broken
-        comm_cost = 1.0 - critical_links_maintained
+        # Calculate distance matrix
+        diff = jnp.expand_dims(positions, 1) - jnp.expand_dims(positions, 0)  # [i, j]: i -> j
+        distances = jnp.linalg.norm(diff, axis=-1)
+        
+        # Calculate unit direction vectors from i to j
+        norms = jnp.maximum(distances, 1e-10)
+        diff_normalized = diff / jnp.expand_dims(norms, -1)  # e_ij
+        
+        # Direction vector for each agent: v_i = [cos(psi_i), sin(psi_i)]
+        direction_vectors = jnp.stack([
+            jnp.cos(orientations),  # cos(psi_i)
+            jnp.sin(orientations)   # sin(psi_i)
+        ], axis=1)
+        
+        # Compute dot products: v_i · e_ij
+        dot_products = jnp.sum(
+            jnp.expand_dims(direction_vectors, 1) * diff_normalized, 
+            axis=2
+        )
+        
+        # Square the dot product values: (v_i · e_ij)^2
+        dot_products_squared = dot_products ** 2
+        
+        # Convert alpha_max to radians and calculate cos^2(alpha_max)
+        alpha_max_rad = jnp.deg2rad(self.params["alpha_max"])
+        cos_alpha_max_squared = jnp.cos(alpha_max_rad) ** 2
+        
+        # Calculate condition 1: (v_i · e_ij)^2 - cos^2(alpha_max) >= 0
+        condition1 = dot_products_squared - cos_alpha_max_squared
+        
+        # For j to i direction
+        reverse_diff_normalized = -diff_normalized  # e_ji
+        rev_dot_products = jnp.sum(
+            jnp.expand_dims(direction_vectors, 0) * reverse_diff_normalized,
+            axis=2
+        )
+        rev_dot_products_squared = rev_dot_products ** 2
+        
+        # Calculate condition 2: (v_j · e_ji)^2 - cos^2(alpha_max) >= 0
+        condition2 = rev_dot_products_squared - cos_alpha_max_squared
+        
+        # Calculate condition 3: d_max^2 - d_ij^2 >= 0
+        d_max_squared = self.params["comm_radius"] ** 2
+        distances_squared = distances ** 2
+        condition3 = d_max_squared - distances_squared
+        
+        # 为每个智能体计算与其初始邻居之间的每个条件成本
+        def process_agent(i, acc):
+            neighbor_idx = self.neighbor_indices[i]
+            # Only process valid neighbor indices (-1 means no initial neighbor)
+            is_valid_neighbor = neighbor_idx != -1
+            
+            # Calculate individual condition costs
+            cost_condition1 = condition1[i, neighbor_idx]
+            cost_condition2 = condition2[i, neighbor_idx]
+            cost_condition3 = condition3[i, neighbor_idx]
+            
+            # Apply valid neighbor mask
+            cost_condition1 = jnp.where(is_valid_neighbor, cost_condition1, 0.0)
+            cost_condition2 = jnp.where(is_valid_neighbor, cost_condition2, 0.0)
+            cost_condition3 = jnp.where(is_valid_neighbor, cost_condition3, 0.0)
+            
+            # Calculate total for averaging
+            total_cost = cost_condition1 + cost_condition2 + cost_condition3
+            
+            # 返回所有条件的单独成本和总成本
+            return acc[0] + cost_condition1, acc[1] + cost_condition2, acc[2] + cost_condition3, acc[3] + total_cost
+        
+        # 计算所有智能体的连接成本总和
+        init_acc = (jnp.array(0.0), jnp.array(0.0), jnp.array(0.0), jnp.array(0.0))
+        cost1_sum, cost2_sum, cost3_sum, total_cost_sum = jax.lax.fori_loop(
+            0, self.num_agents, process_agent, init_acc
+        )
+        
+        # Count number of valid initial links (where neighbor_indices != -1)
+        n_initial_links = jnp.sum(self.neighbor_indices != -1)
+        # Ensure we don't divide by zero
+        n_initial_links = jnp.maximum(n_initial_links, 1)
+        
+        # 计算每个条件的平均成本
+        avg_cost1 = cost1_sum / n_initial_links
+        avg_cost2 = cost2_sum / n_initial_links
+        avg_cost3 = cost3_sum / n_initial_links
+        
         # Broadcast to all agents
-        comm_cost = jnp.ones((self.num_agents,)) * comm_cost
+        condition1_cost = jnp.ones((self.num_agents,)) * avg_cost1
+        condition2_cost = jnp.ones((self.num_agents,)) * avg_cost2
+        condition3_cost = jnp.ones((self.num_agents,)) * avg_cost3
         
-        # Combine costs
-        cost = jnp.stack([agent_cost, comm_cost], axis=1)
+        # Combine all costs into a single matrix [n_agents, 4]
+        cost = jnp.stack([
+            agent_cost,         # 智能体碰撞成本
+            condition1_cost,    # 视野角度条件1成本（i到j方向）
+            condition2_cost,    # 视野角度条件2成本（j到i方向）
+            condition3_cost     # 通信距离条件成本
+        ], axis=1)
         
-        # Add margin
+        # Add margin as required by safe RL:
+        # - If cost <= 0 (safe), subtract eps to make it more negative (more safe)
+        # - If cost > 0 (unsafe), add eps to make it more positive (more unsafe)
         eps = 0.5
         cost = jnp.where(cost <= 0.0, cost - eps, cost + eps)
+        
+        # Limit minimum cost to -1.0 (not too negative)
         cost = jnp.clip(cost, a_min=-1.0)
         
         return cost
@@ -706,6 +746,86 @@ class MPEFoV(MPE):
     
     def action_lim(self) -> Tuple[Action, Action]:
         """Define action limits"""
-        lower_lim = jnp.ones(2) * -1.0
-        upper_lim = jnp.ones(2)
-        return lower_lim, upper_lim 
+        lower_lim = jnp.ones(3) * -1.0
+        upper_lim = jnp.ones(3)
+        return lower_lim, upper_lim
+    
+    def render_video(
+            self,
+            rollout: Rollout,
+            video_path: pathlib.Path,
+            Ta_is_unsafe=None,
+            viz_opts: dict = None,
+            dpi: int = 100,
+            **kwargs
+    ) -> None:
+        """Render a video of the FOV environment with visualization of field of view"""
+        if viz_opts is None:
+            viz_opts = {}
+            
+        # Add FOV-specific visualization options
+        viz_opts.update({
+            "show_fov": True,
+            "fov_alpha": 0.2,
+            "fov_angle": self.params["alpha_max"]
+        })
+        
+        # Call the base MPE render_video method with FOV-specific parameters
+        render_mpe(
+            rollout=rollout, 
+            video_path=video_path, 
+            side_length=self.area_size, 
+            dim=2, 
+            n_agent=self.num_agents,
+            n_obs=self.params['n_obs'], 
+            r=self.params["car_radius"], 
+            obs_r=self.params['obs_radius'],
+            cost_components=self.cost_components, 
+            Ta_is_unsafe=Ta_is_unsafe, 
+            viz_opts=viz_opts,
+            n_goal=self.num_goals, 
+            dpi=dpi, 
+            agent_types=self.agent_types,  # Pass agent types to distinguish leaders and followers
+            include_orientation=True,  # Flag to indicate agents have orientation
+            **kwargs
+        )
+    
+    def get_graph(self, env_state: MPEFoVState) -> MPEFoVGraphsTuple:
+        """
+        创建GraphsTuple，区分leader和follower
+        """
+        # node features
+        # states
+        node_feats = jnp.zeros((self.num_agents + self.num_goals + self.params["n_obs"], self.node_dim))
+        node_feats = node_feats.at[:self.num_agents, :self.state_dim].set(env_state.agent)
+        node_feats = node_feats.at[
+                    self.num_agents: self.num_agents + self.num_goals, :self.state_dim].set(env_state.goal)
+        if self.params["n_obs"] > 0:
+            node_feats = node_feats.at[self.num_agents + self.num_goals:, :self.state_dim].set(env_state.obs)
+
+        # indicators - distinguish leaders and followers
+        # Leader: 0001
+        node_feats = node_feats.at[:self.num_goals, 9].set(1.0)
+        # Follower: 0010
+        node_feats = node_feats.at[self.num_goals:self.num_agents, 8].set(1.0)
+        # Goal: 0100
+        node_feats = node_feats.at[self.num_agents: self.num_agents + self.num_goals, 7].set(1.0)
+        # Obstacle: 1000
+        if self.params["n_obs"] > 0:
+            node_feats = node_feats.at[self.num_agents + self.num_goals:, 6].set(1.0)
+
+        # node type
+        node_type = -jnp.ones((self.num_agents + self.num_goals + self.params["n_obs"],), dtype=jnp.int32)
+        node_type = node_type.at[:self.num_agents].set(MPE.AGENT)
+        node_type = node_type.at[self.num_agents: self.num_agents + self.num_goals].set(MPE.GOAL)
+        if self.params["n_obs"] > 0:
+            node_type = node_type.at[self.num_agents + self.num_goals:].set(MPE.OBS)
+
+        # edges
+        edge_blocks = self.edge_blocks(env_state)
+
+        # create graph
+        states = jnp.concatenate([env_state.agent, env_state.goal], axis=0)
+        if self.params["n_obs"] > 0:
+            states = jnp.concatenate([states, env_state.obs], axis=0)
+        return GetGraph(node_feats, node_type, edge_blocks, env_state, states).to_padded() 
