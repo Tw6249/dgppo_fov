@@ -1,7 +1,7 @@
 from typing import Optional
 
 from .base import MultiAgentEnv
-from dgppo.env.mpe import MPETarget, MPESpread, MPELine, MPEFormation, MPECorridor, MPEConnectSpread, MPEFoV
+from dgppo.env.mpe import MPETarget, MPESpread, MPELine, MPEFormation, MPECorridor, MPEConnectSpread, MPEFoV, MPEFoV2
 from dgppo.env.lidar_env import LidarSpread, LidarTarget, LidarLine, LidarBicycleTarget
 from dgppo.env.vmas import VMASWheel, VMASReverseTransport
 
@@ -15,6 +15,7 @@ ENV = {
     'MPECorridor': MPECorridor,
     'MPEConnectSpread': MPEConnectSpread,
     'MPEFoV': MPEFoV,
+    'MPEFoV2': MPEFoV2,
     'LidarSpread': LidarSpread,
     'LidarTarget': LidarTarget,
     'LidarLine': LidarLine,
