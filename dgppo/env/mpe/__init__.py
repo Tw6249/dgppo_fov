@@ -6,3 +6,4 @@ from .mpe_spread import MPESpread
 from .mpe_line import MPELine
 from .mpe_fov import MPEFoV
 from .mpe_fov2 import MPEFoV2
+from .mpe_fov3 import MPEFoV3
