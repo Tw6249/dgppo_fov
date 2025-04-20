@@ -17,6 +17,12 @@ def train(args):
 
     # set up environment variables and seed
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    
+    # Set GPU device if specified
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+        print(f"> Using GPU: {args.gpu}")
+    
     if not is_connected():
         os.environ["WANDB_MODE"] = "offline"
     np.random.seed(args.seed)
@@ -75,6 +81,13 @@ def train(args):
         cbf_schedule=not args.no_cbf_schedule,
         cost_schedule=args.cost_schedule
     )
+
+    # 如果指定了从检查点恢复训练
+    if args.load_checkpoint:
+        checkpoint_path = args.load_checkpoint
+        checkpoint_step = args.load_step
+        print(f"> Loading checkpoint from {checkpoint_path}, step {checkpoint_step}")
+        algo.load(checkpoint_path, checkpoint_step)
 
     # Generate a 4 letter random identifier for the run.
     rng_ = np.random.default_rng()
@@ -144,6 +157,8 @@ def main():
     parser.add_argument("--steps", type=int, default=200000)
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--gpu", type=int, default=None, 
+                        help="GPU ID to use for training (e.g., 0, 1). If not specified, all available GPUs will be used.")
     parser.add_argument("--cost-weight", type=float, default=0.)
     parser.add_argument("--n-rays", type=int, default=32)
     parser.add_argument('--full-observation', action='store_true', default=False)
@@ -156,6 +171,12 @@ def main():
     parser.add_argument("--no-cbf-schedule", action="store_true", default=False)
     parser.add_argument("--cost-schedule", action="store_true", default=False)
     parser.add_argument("--no-rnn", action="store_true", default=False)
+    
+    # 添加检查点加载参数
+    parser.add_argument("--load-checkpoint", type=str, default=None, 
+                       help="检查点目录路径，用于恢复训练")
+    parser.add_argument("--load-step", type=int, default=None,
+                       help="要加载的检查点步数")
 
     # NN arguments
     parser.add_argument("--actor-gnn-layers", type=int, default=2)
@@ -179,6 +200,11 @@ def main():
     parser.add_argument("--save-interval", type=int, default=50)
 
     args = parser.parse_args()
+    
+    # 检查检查点参数
+    if args.load_checkpoint and args.load_step is None:
+        parser.error("--load-checkpoint 需要同时指定 --load-step")
+    
     train(args)
 
 
